@@ -43,7 +43,7 @@ function saveSettings() {
 const S = {
   store: null, user: null,
   cats: [], logs: [], summaries: [],
-  view: "cat", sel: null, showDetail: false, editing: null, q: "",
+  view: "home", sel: null, showDetail: false, editing: null, q: "",
   draft: null,              // 編集中の記録の付属情報 {commits, att, removed}
   gh: { key: "", loading: false, list: [], errors: [] },
   week: today(), summary: { text: "", busy: false, err: "", loadedFor: "" },
@@ -102,7 +102,7 @@ function render() {
   lastKey = key;
 
   renderSide();
-  v.innerHTML = S.view === "week" ? viewWeek() : S.view === "settings" ? viewSettings() : viewCat();
+  v.innerHTML = S.view === "home" ? viewHome() : S.view === "week" ? viewWeek() : S.view === "settings" ? viewSettings() : viewCat();
 
   for (const [id, val] of Object.entries(draftVals)) { const el = document.getElementById(id); if (el) el.value = val; }
   openDetails.forEach((id) => { const d = document.getElementById(id); if (d) d.open = true; });
@@ -114,8 +114,8 @@ function render() {
 
 function renderLogin(err = "") {
   $("#root").innerHTML = `<div class="login"><div class="panel">
-    <h1>研究開発支援システム</h1>
-    <p class="muted" style="margin:0">日々の作業と、その理由を残すための研究ログです。</p>
+    <h1>Nexora</h1>
+    <p class="muted" style="margin:0">研究開発支援システム。日々の作業と、その理由を残すための研究ログです。</p>
     ${err ? `<p class="err" style="margin:0">${esc(err)}</p>` : ""}
     <button class="btn pri" id="login" type="button">Googleでログイン</button>
   </div></div>`;
@@ -130,14 +130,34 @@ function renderSide() {
     return `<li><button class="cat" data-cat="${esc(c.id)}" aria-current="${cur}" type="button"><span class="nm">${esc(c.name)}</span><span class="ct">${n}件</span>${nd ? `<span class="sub ${dueCls(dd)}">${esc(nd.label)}：${dueTxt(dd)}</span>` : ""}</button></li>`;
   }).join("") || `<li class="muted">まだありません</li>`;
   $("#side").innerHTML = `
-    <div class="brand">研究開発支援システム<small>RESEARCH LOGBOOK</small></div>
+    <button class="brand" data-view="home" type="button" title="ホームに戻る">Nexora<small>研究開発支援システム</small></button>
     <form class="addcat" id="addcat"><input type="text" id="newcat" placeholder="＋ カテゴリ追加" aria-label="新しいカテゴリ名" maxlength="40"><button class="btn sm" type="submit">追加</button></form>
     <div><div class="lbl" style="margin-bottom:6px">カテゴリ</div><ul class="cats">${items}</ul></div>
     <ul class="nav">
+      <li><button class="navbtn" data-view="home" aria-current="${S.view === "home"}" type="button">ホーム</button></li>
       <li><button class="navbtn" data-view="week" aria-current="${S.view === "week"}" type="button">週次まとめ</button></li>
       <li><button class="navbtn" data-view="settings" aria-current="${S.view === "settings"}" type="button">設定・バックアップ</button></li>
     </ul>
     <div class="side-foot">${isDemo ? "デモモード（このブラウザにだけ保存）" : `${esc(S.user.email)}<br>自動保存オン`}</div>`;
+}
+
+/* ================= view: home ================= */
+function viewHome() {
+  const banner = isDemo ? `<div class="banner">デモモードです。js/config.js にFirebaseの設定を入れると、ログインして全端末で同期できます。</div>` : "";
+  const d = new Date();
+  const head = `${banner}<div class="head"><div><h1>ホーム</h1><div class="purpose">${d.getMonth() + 1}月${d.getDate()}日（${WD[d.getDay()]}）</div></div><div class="actions"><button class="btn" data-view="week" type="button">週次まとめ</button></div></div>`;
+  if (!S.cats.length) return head + `<div class="empty">左上の「＋ カテゴリ追加」で研究テーマ（例：卒研、ドローン）を作ると始められます。</div>`;
+  const dues = [];
+  for (const c of S.cats) {
+    for (const m of c.milestones || []) if (!m.done && m.due) dues.push({ cat: c, label: m.title, due: m.due });
+    if (c.deadline) dues.push({ cat: c, label: "最終期限", due: c.deadline });
+  }
+  dues.sort((a, b) => a.due.localeCompare(b.due));
+  const recent = [...S.logs].sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 8);
+  const catName = (id) => S.cats.find((c) => c.id === id)?.name || "（削除済み）";
+  return `${head}
+  <section class="panel"><h2>近い期限</h2>${dues.length ? `<ul class="hlist">${dues.slice(0, 6).map((x) => { const n = dayDiff(x.due); return `<li><button type="button" data-cat="${esc(x.cat.id)}"><span class="days ${dueCls(n)}">${dueTxt(n)}</span><span class="t">${esc(x.label)}</span><span class="c">${esc(x.cat.name)}</span></button></li>`; }).join("")}</ul>` : `<p class="muted" style="margin:0">期限はまだありません。各カテゴリの「詳細」でロードマップを作ると、ここに並びます。</p>`}</section>
+  <section class="panel"><h2>最近の記録</h2>${recent.length ? `<ul class="hlist">${recent.map((l) => `<li><button type="button" data-cat="${esc(l.categoryId)}"><span class="d">${esc((l.date || "").slice(5).replace("-", "/"))}</span><span class="t">${esc(l.title)}</span><span class="c">${esc(catName(l.categoryId))}</span></button></li>`).join("")}</ul>` : `<p class="muted" style="margin:0">まだ記録がありません。カテゴリを選んで「＋ 追加」から始めましょう。</p>`}</section>`;
 }
 
 /* ================= view: category ================= */
@@ -688,10 +708,8 @@ document.addEventListener("keydown", (ev) => {
     S.user = user;
     if (!user) { S.cats = []; S.logs = []; S.summaries = []; return renderLogin(); }
     const onErr = (e) => { console.error(e); toast(e?.code === "permission-denied" ? "読み込みが拒否されました。firestore.rules を確認してください" : "同期が切れました。再読み込みしてください"); };
-    let first = 0;
     const sub = (c, setter) => S.unsub.push(S.store.subscribe(c, (docs) => {
       setter(docs);
-      if (first < 3 && ++first === 3 && !S.sel && S.cats.length) S.sel = sortedCats()[0].id;
       render();
     }, onErr));
     sub("categories", (d) => (S.cats = d));
