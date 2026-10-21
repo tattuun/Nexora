@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 各ユーザーは users/{自分のUID}/ 以下だけを読み書きできる
+    // さらに自分専用にするなら、下の行の "" を自分のUID（アプリの「設定」に表示）に置き換えて
+    //   && uid == "あなたのUID"
+    // を条件に足してください。
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}
