@@ -12,7 +12,10 @@ GitHub Pages で公開し、データは Firebase（Firestore）に保存しま�
 - 添付（任意）：写真・スクショ（Ctrl+V で貼り付け可）、600KBまでの小さなファイル
 - 週次まとめ：1週間の記録からゼミ報告の下書きを作成（Claude API、または依頼文をコピーして claude.ai に貼る）
 - バックアップ：Markdown／JSON（添付込み）で書き出し、JSONから復元
-- ホーム：全カテゴリの近い期限と最近の記録を一覧（左上の「Nexora」でいつでも戻れる）
+- ホーム：研究テーマ（目的＝簡略版）、近い期限、最近の記録を一覧（左上の「Nexora」でいつでも戻れる）
+- 研究の流れ（詳細の中）：WordやMarkdownを取り込み、見出し・表・チェックボックスつきで表示・編集
+- 関連資料・成果物：PDF・Word・画像・MarkdownをNexora内で閲覧。GitHubのファイル／アップロード（15MBまで）／リンクの3通りで登録
+- 使い方：アプリ内の「使い方」画面でいつでも確認
 
 ## 使い方（普段の1日の流れ）
 
@@ -124,6 +127,8 @@ users/{uid}/categories/{id}   名前・目的・期限・repos[]・milestones[]
 users/{uid}/logs/{id}         日付・作業・理由・結果・commits[]・attach[]（サムネのみ）
 users/{uid}/attachments/{id}  添付の本体（dataURL、1件1MB未満）
 users/{uid}/summaries/{週の月曜日}  週次まとめの下書き
+users/{uid}/docs/{id}         資料・成果物（GitHubのパス／アップロード情報／リンク）
+users/{uid}/blobs/{id}_{n}    アップロードした資料の本体（700KBずつ分割）
 ```
 
 ## 運用のコツ
@@ -131,6 +136,10 @@ users/{uid}/summaries/{週の月曜日}  週次まとめの下書き
 - **コードはGitで管理し、記録には「なぜ」を書く**：コミットメッセージは「何を変えたか」、記録は「なぜそうしたか」と役割を分けると、後から読み返して一番役に立ちます
 - 疲れている日は「ひとことで」だけでも保存できます（必須項目はそれだけ）
 - 月に1回くらい JSON バックアップを取っておくと安心です
+
+## 同梱ライブラリ
+
+Word・Markdownの表示用に `js/vendor/` へ marked / DOMPurify / mammoth / turndown を同梱しています（ライセンスは `js/vendor/LICENSES.txt`）。外部サーバーに頼らないので、長期間そのまま動きます。
 
 ## 制限・注意
 

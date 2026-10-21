@@ -1,6 +1,7 @@
 import { createStore, isDemo } from "./store.js";
 import { ALLOWED_EMAIL } from "./config.js";
-import { parseRepo, parseCommitUrl, commitsOn, commitInfo } from "./github.js";
+import { parseRepo, parseCommitUrl, commitsOn, commitInfo, githubFileUrl, listRepoFiles, fetchRepoFile } from "./github.js";
+import { renderMarkdown, cachedMarkdown, docxToHtml, docxToMarkdown, fileKind, mimeOf, saveUpload, loadUpload, removeUpload } from "./docs.js";
 import { DEFAULT_MODEL, weekRange, shiftDate, buildPrompt, callClaude, ymd } from "./summary.js";
 
 /* ================= util ================= */
@@ -42,19 +43,23 @@ function saveSettings() {
 /* ================= state ================= */
 const S = {
   store: null, user: null,
-  cats: [], logs: [], summaries: [],
+  cats: [], logs: [], summaries: [], docs: [],
   view: "home", sel: null, showDetail: false, editing: null, q: "",
   draft: null,              // 編集中の記録の付属情報 {commits, att, removed}
   gh: { key: "", loading: false, list: [], errors: [] },
   week: today(), summary: { text: "", busy: false, err: "", loadedFor: "" },
   settings: loadSettings(),
   unsub: [],
+  syncError: "",
+  flowEdit: false, flowOverride: null,
 };
 
 /* ================= storage helpers ================= */
+const DENIED_MSG = "Firestoreに読み書きを拒否されています。追加しても保存・表示されません。Firebaseの「Firestore → ルール」が公開済みか、ルール内のUIDが「設定・バックアップ」に表示されるUIDと一字一句同じかを確認してください。";
 function fail(e) {
   console.error(e);
   const c = e?.code || "";
+  if (c === "permission-denied") { S.syncError = DENIED_MSG; render(); }
   toast(c === "quota" || c === "resource-exhausted" ? "保存容量の上限です。古い添付を削除してください"
     : c === "permission-denied" ? "保存が拒否されました。firestore.rules とログイン中のアカウントを確認してください"
     : "保存に失敗しました。通信状況を確認して、もう一度お試しください");
@@ -102,7 +107,8 @@ function render() {
   lastKey = key;
 
   renderSide();
-  v.innerHTML = S.view === "home" ? viewHome() : S.view === "week" ? viewWeek() : S.view === "settings" ? viewSettings() : viewCat();
+  v.innerHTML = (S.syncError ? `<div class="banner err-banner" role="alert">${esc(S.syncError)}</div>` : "") + (S.view === "home" ? viewHome() : S.view === "week" ? viewWeek() : S.view === "settings" ? viewSettings() : S.view === "help" ? viewHelp() : viewCat());
+  hydrateMarkdown();
 
   for (const [id, val] of Object.entries(draftVals)) { const el = document.getElementById(id); if (el) el.value = val; }
   openDetails.forEach((id) => { const d = document.getElementById(id); if (d) d.open = true; });
@@ -137,6 +143,7 @@ function renderSide() {
       <li><button class="navbtn" data-view="home" aria-current="${S.view === "home"}" type="button">ホーム</button></li>
       <li><button class="navbtn" data-view="week" aria-current="${S.view === "week"}" type="button">週次まとめ</button></li>
       <li><button class="navbtn" data-view="settings" aria-current="${S.view === "settings"}" type="button">設定・バックアップ</button></li>
+      <li><button class="navbtn" data-view="help" aria-current="${S.view === "help"}" type="button">使い方</button></li>
     </ul>
     <div class="side-foot">${isDemo ? "デモモード（このブラウザにだけ保存）" : `${esc(S.user.email)}<br>自動保存オン`}</div>`;
 }
@@ -156,6 +163,7 @@ function viewHome() {
   const recent = [...S.logs].sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 8);
   const catName = (id) => S.cats.find((c) => c.id === id)?.name || "（削除済み）";
   return `${head}
+  ${viewThemes()}
   <section class="panel"><h2>近い期限</h2>${dues.length ? `<ul class="hlist">${dues.slice(0, 6).map((x) => { const n = dayDiff(x.due); return `<li><button type="button" data-cat="${esc(x.cat.id)}"><span class="days ${dueCls(n)}">${dueTxt(n)}</span><span class="t">${esc(x.label)}</span><span class="c">${esc(x.cat.name)}</span></button></li>`; }).join("")}</ul>` : `<p class="muted" style="margin:0">期限はまだありません。各カテゴリの「詳細」でロードマップを作ると、ここに並びます。</p>`}</section>
   <section class="panel"><h2>最近の記録</h2>${recent.length ? `<ul class="hlist">${recent.map((l) => `<li><button type="button" data-cat="${esc(l.categoryId)}"><span class="d">${esc((l.date || "").slice(5).replace("-", "/"))}</span><span class="t">${esc(l.title)}</span><span class="c">${esc(catName(l.categoryId))}</span></button></li>`).join("")}</ul>` : `<p class="muted" style="margin:0">まだ記録がありません。カテゴリを選んで「＋ 追加」から始めましょう。</p>`}</section>`;
 }
@@ -175,6 +183,7 @@ function viewCat() {
   return `${banner}
   <div class="head"><div><h1>${esc(c.name)}</h1><div class="purpose">${c.purpose ? esc(c.purpose) : "目的・期限・リポジトリは「詳細」から設定できます"}${nd ? ` <span class="days ${dueCls(dd)}" style="margin-left:6px">${esc(nd.label)} ${dueTxt(dd)}</span>` : ""}</div></div>
   <div class="actions"><button class="btn" id="tg-detail" aria-pressed="${S.showDetail}" type="button">詳細</button><button class="btn pri" id="new-log" type="button">＋ 追加</button></div></div>
+  ${viewOutputs(c)}
   ${S.showDetail ? viewDetail(c) : ""}
   ${S.editing ? viewEditor(c) : ""}
   <div class="tools"><input type="search" id="q" placeholder="このカテゴリの記録を検索（作業・理由・コード・コミット）" value="${esc(S.q)}" aria-label="検索"><span class="lbl">${logs.length}件</span></div>
@@ -201,7 +210,8 @@ function viewDetail(c) {
       return `<li class="${m.done ? "done" : ""}"><input type="checkbox" data-ms-toggle="${esc(m.id)}" ${m.done ? "checked" : ""} aria-label="完了"><span class="t">${esc(m.title)}</span><span class="due ${m.done ? "" : dueCls(d)}">${m.due ? esc(m.due.slice(5).replace("-", "/")) + (m.done ? "" : " · " + dueTxt(d)) : "期限なし"}</span><button class="x" data-ms-del="${esc(m.id)}" aria-label="削除" type="button">×</button></li>`;
     }).join("") || `<li class="muted" style="display:block">マイルストーンを追加すると、記録をその段階に紐づけられます</li>`}</ul>
     <form class="ms-add" id="ms-add"><input type="text" id="ms-title" placeholder="マイルストーン（例：データセット作成）" aria-label="マイルストーン名"><input type="date" id="ms-due" aria-label="期限"><button class="btn sm" type="submit">追加</button></form>
-    <div class="actions"><button class="btn danger sm" data-arm="cat" type="button">このカテゴリを削除</button></div>
+    ${viewFlow(c)}
+    <div class="actions" style="border-top:1px solid var(--line);padding-top:14px"><button class="btn danger sm" data-arm="cat" type="button">このカテゴリを削除</button></div>
   </section>`;
 }
 
@@ -470,7 +480,7 @@ async function exportJson() {
   toast("書き出し中…");
   try {
     const out = { app: "research-log", version: 1, exportedAt: new Date().toISOString() };
-    for (const c of ["categories", "logs", "summaries", "attachments"]) out[c] = await S.store.all(c);
+    for (const c of ["categories", "logs", "summaries", "attachments", "docs", "blobs"]) out[c] = await S.store.all(c);
     download(`research-log-${today()}.json`, JSON.stringify(out, null, 1), "application/json");
   } catch (e) { fail(e); }
 }
@@ -480,7 +490,7 @@ async function importJson(file) {
   if (data?.app !== "research-log") return toast("このシステムのバックアップファイルではありません");
   let n = 0;
   try {
-    for (const c of ["categories", "logs", "summaries", "attachments"]) {
+    for (const c of ["categories", "logs", "summaries", "attachments", "docs", "blobs"]) {
       for (const d of data[c] || []) { if (d?.id) { await S.store.put(c, d.id, strip(d)); n++; } }
     }
     toast(`${n}件を読み込みました`);
@@ -548,8 +558,13 @@ document.addEventListener("click", async (ev) => {
       return;
     }
     armed = null; clearTimeout(armT);
-    if (t.dataset.arm === "cat") {
+    if (t.dataset.arm.startsWith("doc:")) {
+      const d = S.docs.find((x) => x.id === t.dataset.arm.slice(4));
+      if (d) { removeUpload(S.store, d.file).catch(fail); remove("docs", d.id); }
+      toast("削除しました");
+    } else if (t.dataset.arm === "cat") {
       for (const l of logsOf(c.id)) { for (const a of l.attach || []) remove("attachments", a.id); remove("logs", l.id); }
+      for (const d of docsOf(c.id)) { removeUpload(S.store, d.file).catch(fail); remove("docs", d.id); }
       remove("categories", c.id);
       S.sel = null; S.showDetail = false;
       toast("カテゴリを削除しました");
@@ -609,6 +624,20 @@ document.addEventListener("click", async (ev) => {
     saveSettings(); S.gh.key = ""; toast("設定を保存しました"); return;
   }
   if (t.id === "exp-md") { exportMd(); return; }
+
+  // 研究の流れ・資料・成果物
+  if (t.id === "flow-edit") { S.flowEdit = true; S.flowOverride = null; lastKey = ""; render(); $("#d-flow")?.focus(); return; }
+  if (t.id === "flow-cancel") { S.flowEdit = false; S.flowOverride = null; render(); return; }
+  if (t.id === "flow-save") {
+    const flow = $("#d-flow").value.replace(/\s+$/, "") + "\n";
+    S.flowEdit = false; S.flowOverride = null;
+    put("categories", c.id, { ...strip(c), flow });
+    render(); toast("研究の流れを保存しました"); return;
+  }
+  if (t.dataset.docAdd) { openDocForm(t.dataset.docAdd, null); return; }
+  if (t.dataset.docEdit) { const d = S.docs.find((x) => x.id === t.dataset.docEdit); if (d) openDocForm(d.section, d); return; }
+  if (t.dataset.docView) { const d = S.docs.find((x) => x.id === t.dataset.docView); if (d) openViewer(d); return; }
+  if (t.dataset.outOpen) { S.view = "cat"; S.sel = t.dataset.outOpen; S.editing = null; S.draft = null; render(); const b = $("#out-box"); if (b) { b.open = true; b.scrollIntoView({ block: "start" }); } return; }
   if (t.id === "exp-json") { exportJson(); return; }
 });
 
@@ -672,6 +701,7 @@ document.addEventListener("change", (ev) => {
   if (t.id === "e-date") { render(); loadCommits(); }
   if (t.id === "e-file") { addFiles([...t.files]); t.value = ""; }
   if (t.id === "imp-json" && t.files[0]) { importJson(t.files[0]); t.value = ""; }
+  if (t.id === "flow-import" && t.files[0]) { importFlow(t.files[0]); t.value = ""; }
 });
 document.addEventListener("paste", (ev) => {
   if (!S.draft) return;
@@ -691,9 +721,314 @@ document.addEventListener("drop", (ev) => {
   addFiles([...ev.dataTransfer.files]);
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") $("#lightbox").hidden = true;
+  if (ev.key === "Escape") { $("#lightbox").hidden = true; closeModal(); }
   if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter" && S.draft) { ev.preventDefault(); $("#editor")?.requestSubmit(); }
 });
+
+/* ================= 研究の流れ・資料・成果物 ================= */
+const KINDS = {
+  output: ["発表スライド", "予稿・論文", "ポスター", "報告書", "デモ動画", "その他"],
+  flow: ["ロードマップ", "進捗報告", "計画書", "メモ", "その他"],
+};
+const docsOf = (catId, section) => S.docs
+  .filter((d) => d.categoryId === catId && (!section || d.section === section))
+  .sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.createdAt || 0) - (a.createdAt || 0));
+
+function viewDocList(c, section) {
+  const ds = docsOf(c.id, section);
+  const items = ds.map((d) => {
+    const canView = d.source === "upload" || d.source === "github";
+    const gh = d.source === "github" ? `<a class="btn sm" href="${esc(githubFileUrl(d.gh.repo, d.gh.path))}" target="_blank" rel="noopener">GitHub</a>` : "";
+    const link = d.url ? `<a class="btn sm" href="${esc(d.url)}" target="_blank" rel="noopener">リンク</a>` : "";
+    const file = d.source === "upload" ? d.file?.name : d.source === "github" ? d.gh?.path.split("/").pop() : "";
+    return `<li><span class="chip">${esc(d.kind || "資料")}</span>
+      <div class="dm"><b>${esc(d.title)}</b><span class="muted">${esc([d.date ? d.date.replace(/-/g, "/") : "", d.note, file].filter(Boolean).join("　"))}</span></div>
+      <span class="actions">${canView ? `<button class="btn sm pri" data-doc-view="${esc(d.id)}" type="button">閲覧</button>` : ""}${gh}${link}<button class="btn sm" data-doc-edit="${esc(d.id)}" type="button">編集</button><button class="btn sm danger" data-arm="doc:${esc(d.id)}" type="button">削除</button></span></li>`;
+  }).join("");
+  return `${ds.length ? `<ul class="docs">${items}</ul>` : ""}
+    <div><button class="btn sm" data-doc-add="${section}" type="button">＋ ${section === "output" ? "成果物" : "資料"}を追加</button></div>`;
+}
+
+function viewOutputs(c) {
+  const n = docsOf(c.id, "output").length;
+  return `<details class="panel outs" id="out-box"><summary><span class="h2">成果物</span><span class="lbl">${n}件</span><span class="hint">発表資料・論文などを閲覧</span></summary>
+    <div class="outs-body">${n ? "" : `<p class="muted" style="margin:0">発表スライドや予稿を登録すると、ここから閲覧したりGitHubに飛んだりできます。</p>`}${viewDocList(c, "output")}</div></details>`;
+}
+
+function viewFlow(c) {
+  const flow = c.flow || "";
+  let body;
+  if (S.flowEdit) {
+    body = `<textarea class="code" id="d-flow" rows="16" spellcheck="false" placeholder="# 研究概要&#10;&#10;## 手法&#10;- …&#10;&#10;## ロードマップ&#10;- [ ] Week 1：…">${esc(S.flowOverride ?? flow)}</textarea>
+      <p class="hint" style="margin:0">書き方：<code># 見出し</code>　<code>- 箇条書き</code>　<code>- [ ] やること</code>　<code>**太字**</code>　<code>| 表 | の | 列 |</code>　Wordを取り込むと自動でこの形に変換されます。</p>
+      <div class="actions" style="justify-content:space-between"><label class="btn sm">Word・Markdownから取り込む<input type="file" id="flow-import" accept=".docx,.md,.markdown,.txt" hidden></label><span class="actions"><button class="btn sm" id="flow-cancel" type="button">キャンセル</button><button class="btn pri sm" id="flow-save" type="button">研究の流れを保存</button></span></div>`;
+  } else if (flow.trim()) {
+    body = `<div class="md flow" data-md-cat="${esc(c.id)}">${cachedMarkdown(flow) ?? `<p class="muted">表示を準備中…</p>`}</div>
+      <div class="actions"><button class="btn sm" id="flow-edit" type="button">研究の流れを編集</button></div>`;
+  } else {
+    body = `<p class="muted" style="margin:0">まだありません。Wordの研究ロードマップなどを取り込むと、見出しや表つきでここに表示されます。</p>
+      <div class="actions"><button class="btn sm" id="flow-edit" type="button">書く・Wordから取り込む</button></div>`;
+  }
+  return `<div class="flow-sec">
+    <div class="fld"><span>研究の流れ <em>（概要・手法・計画など。目的欄が「簡略版」、ここが「詳しい版」です）</em></span></div>
+    ${body}
+    <div class="fld" style="margin-top:6px"><span>関連資料 <em>（Word・PDFをそのまま閲覧）</em></span></div>
+    ${viewDocList(c, "flow")}
+  </div>`;
+}
+
+function viewThemes() {
+  const cs = sortedCats();
+  if (!cs.length) return "";
+  return `<section class="panel"><h2>研究テーマ</h2><ul class="themes">${cs.map((c) => {
+    const ms = c.milestones || [];
+    const done = ms.filter((m) => m.done).length;
+    const outs = docsOf(c.id, "output").length;
+    return `<li><button type="button" data-cat="${esc(c.id)}" class="theme"><b>${esc(c.name)}</b><span class="p">${c.purpose ? esc(c.purpose) : `<span class="muted">目的は「詳細」で設定できます</span>`}</span>
+      ${ms.length ? `<span class="progress" aria-hidden="true"><i style="width:${Math.round((done / ms.length) * 100)}%"></i></span><span class="muted">ロードマップ ${done}/${ms.length}</span>` : ""}</button>
+      ${outs ? `<button type="button" class="btn sm" data-out-open="${esc(c.id)}">成果物 ${outs}件</button>` : ""}</li>`;
+  }).join("")}</ul></section>`;
+}
+
+function hydrateMarkdown() {
+  document.querySelectorAll("[data-md-cat]").forEach((el) => {
+    const c = S.cats.find((x) => x.id === el.dataset.mdCat);
+    if (!c?.flow || cachedMarkdown(c.flow)) return;
+    renderMarkdown(c.flow).then((html) => { if (el.isConnected) el.innerHTML = html; })
+      .catch((e) => { el.innerHTML = `<p class="err">${esc(e.message)}</p>`; });
+  });
+}
+
+async function importFlow(file) {
+  const ext = file.name.toLowerCase().split(".").pop();
+  if (ext === "doc") return toast("古い形式の .doc は読めません。Wordで .docx として保存し直してください");
+  toast("取り込み中…");
+  try {
+    const md = ext === "docx" ? await docxToMarkdown(await file.arrayBuffer()) : await file.text();
+    const cur = $("#d-flow")?.value.trim();
+    S.flowOverride = cur ? `${cur}\n\n${md}` : md;
+    S.flowEdit = true;
+    lastKey = ""; // 取り込んだ内容で入力欄を上書きする
+    render();
+    toast(cur ? "末尾に取り込みました。確認して保存してください" : "取り込みました。確認して保存してください");
+  } catch (e) {
+    console.error(e);
+    toast("取り込めませんでした。ファイルが壊れていないか確認してください");
+  }
+}
+
+/* ---------- モーダル（資料の登録・閲覧） ---------- */
+let modalUrl = null;
+function showModal(html, wide) {
+  const m = $("#modal");
+  $("#modal-box").className = "modal-box" + (wide ? " wide" : "");
+  $("#modal-box").innerHTML = html;
+  m.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+function closeModal() {
+  if ($("#modal").hidden) return;
+  $("#modal").hidden = true;
+  $("#modal-box").innerHTML = "";
+  document.body.style.overflow = "";
+  if (modalUrl) { URL.revokeObjectURL(modalUrl); modalUrl = null; }
+}
+
+let docForm = null; // { section, doc, catId }
+function openDocForm(section, doc) {
+  const c = cat();
+  docForm = { section, doc, catId: c.id };
+  const d = doc || { kind: KINDS[section][0], date: today(), source: (c.repos || []).length ? "github" : "upload" };
+  const repos = c.repos || [];
+  const label = section === "output" ? "成果物" : "資料";
+  showModal(`<form id="doc-form" class="mform">
+    <div class="mhead"><b>${doc ? `${label}を編集` : `${label}を追加`}</b><button class="x" data-modal-close type="button" aria-label="閉じる">×</button></div>
+    <div class="mbody pad">
+      <label class="fld"><span>タイトル</span><input type="text" id="df-title" value="${esc(d.title)}" required maxlength="120" placeholder="${section === "output" ? "例：電気関係学会東北支部連合大会 発表スライド" : "例：研究ロードマップ（シンポジウムまで）"}"></label>
+      <div class="row">
+        <label class="fld"><span>種類</span><select id="df-kind">${KINDS[section].map((k) => `<option ${d.kind === k ? "selected" : ""}>${k}</option>`).join("")}</select></label>
+        <label class="fld"><span>日付</span><input type="date" id="df-date" value="${esc(d.date)}"></label>
+      </div>
+      <label class="fld"><span>場所・メモ <em>（任意）</em></span><input type="text" id="df-note" value="${esc(d.note)}" placeholder="例：2026年度 電気関係学会東北支部連合大会"></label>
+      <fieldset class="src"><legend>ファイルの置き場所</legend>
+        <label><input type="radio" name="df-src" value="github" ${d.source === "github" ? "checked" : ""} ${repos.length ? "" : "disabled"}> GitHubのファイル${repos.length ? "" : "（詳細でリポジトリ登録が必要）"}</label>
+        <label><input type="radio" name="df-src" value="upload" ${d.source === "upload" ? "checked" : ""}> Nexoraにアップロード（15MBまで）</label>
+        <label><input type="radio" name="df-src" value="link" ${d.source === "link" ? "checked" : ""}> リンクだけ（Google Drive等）</label>
+      </fieldset>
+      <div class="srcbox" data-src="github">
+        <div class="row">
+          <label class="fld"><span>リポジトリ</span><select id="df-repo">${repos.map((r) => `<option ${d.gh?.repo === r ? "selected" : ""}>${esc(r)}</option>`).join("")}</select></label>
+          <div class="fld"><span>&nbsp;</span><button class="btn sm" id="df-list" type="button">ファイル一覧を読み込む</button></div>
+        </div>
+        <label class="fld"><span>ファイルのパス</span><input type="text" id="df-path" list="df-paths" value="${esc(d.gh?.path)}" placeholder="例：docs/symposium_slides.pdf"><datalist id="df-paths"></datalist></label>
+        <p class="hint" id="df-list-msg" style="margin:0">PDF・Word・画像・Markdown・PowerPointを一覧に出します。PowerPointは閲覧できないので、PDF版も一緒にコミットしておくのがおすすめです。</p>
+      </div>
+      <div class="srcbox" data-src="upload">
+        <label class="fld"><span>ファイル ${d.file ? `<em>（現在：${esc(d.file.name)}。選ぶと差し替え）</em>` : ""}</span><input type="file" id="df-file" accept=".pdf,.docx,.pptx,.md,.txt,.png,.jpg,.jpeg,.gif,.webp"></label>
+      </div>
+      <label class="fld"><span>関連リンク <em>${d.source === "link" ? "" : "（任意）"}</em></span><input type="url" id="df-url" value="${esc(d.url)}" placeholder="https://…"></label>
+      <p class="err" id="df-err" style="margin:0" hidden></p>
+    </div>
+    <div class="mfoot"><button class="btn" data-modal-close type="button">キャンセル</button><button class="btn pri" id="df-save" type="submit">保存</button></div>
+  </form>`);
+  syncSrcBoxes();
+  $("#df-title").focus();
+}
+function syncSrcBoxes() {
+  const v = document.querySelector('input[name="df-src"]:checked')?.value;
+  document.querySelectorAll(".srcbox").forEach((b) => (b.hidden = b.dataset.src !== v));
+}
+async function loadRepoList() {
+  const repo = $("#df-repo").value;
+  const msg = $("#df-list-msg");
+  msg.textContent = "読み込み中…";
+  try {
+    const files = await listRepoFiles(repo, S.settings.githubToken);
+    $("#df-paths").innerHTML = files.map((f) => `<option value="${esc(f.path)}">${kb(f.size)}</option>`).join("");
+    msg.textContent = files.length ? `${files.length}件見つかりました。パスの欄をクリックすると候補が出ます。` : "資料らしいファイルが見つかりません。先にVS Codeでコミット＆同期してください。";
+    $("#df-path").focus();
+  } catch (e) { msg.textContent = e.message; }
+}
+async function saveDocForm() {
+  const f = docForm;
+  const err = $("#df-err");
+  const showErr = (m) => { err.textContent = m; err.hidden = false; };
+  const src = document.querySelector('input[name="df-src"]:checked')?.value;
+  const old = f.doc;
+  const body = {
+    categoryId: f.catId, section: f.section,
+    title: $("#df-title").value.trim(), kind: $("#df-kind").value, date: $("#df-date").value,
+    note: $("#df-note").value.trim(), url: $("#df-url").value.trim(), source: src,
+    createdAt: old?.createdAt || Date.now(), updatedAt: Date.now(),
+  };
+  if (!body.title) return showErr("タイトルを入れてください");
+  const id = old?.id || uid();
+  const fileInput = $("#df-file");
+  if (src === "github") {
+    const path = $("#df-path").value.trim().replace(/^\/+/, "");
+    if (!path) return showErr("ファイルのパスを入れてください（「ファイル一覧を読み込む」で候補が出ます）");
+    body.gh = { repo: $("#df-repo").value, path };
+  } else if (src === "upload") {
+    if (!fileInput.files[0] && !old?.file) return showErr("ファイルを選んでください");
+  } else if (!body.url) return showErr("リンクのURLを入れてください");
+
+  const btn = $("#df-save");
+  btn.disabled = true;
+  try {
+    if (src === "upload" && fileInput.files[0]) {
+      btn.textContent = "アップロード中…";
+      const fileId = uid();
+      body.file = await saveUpload(S.store, fileInput.files[0], fileId);
+      if (old?.file) removeUpload(S.store, old.file).catch(fail);
+    } else if (src === "upload") body.file = old.file;
+    else if (old?.file) removeUpload(S.store, old.file).catch(fail);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "保存";
+    return showErr(e.message?.includes("MB") ? e.message : "アップロードに失敗しました。通信状況を確認してください");
+  }
+  put("docs", id, body);
+  closeModal();
+  toast("保存しました");
+}
+
+async function openViewer(d) {
+  const ghUrl = d.source === "github" ? githubFileUrl(d.gh.repo, d.gh.path) : "";
+  const name = d.source === "upload" ? d.file.name : d.gh.path.split("/").pop();
+  showModal(`<div class="mhead"><b>${esc(d.title)}</b><span class="actions">
+      ${ghUrl ? `<a class="btn sm" href="${esc(ghUrl)}" target="_blank" rel="noopener">GitHubで開く</a>` : ""}
+      ${d.url ? `<a class="btn sm" href="${esc(d.url)}" target="_blank" rel="noopener">リンク</a>` : ""}
+      <a class="btn sm" id="mv-tab" target="_blank" rel="noopener" hidden>新しいタブで開く</a>
+      <a class="btn sm" id="mv-dl" download="${esc(name)}" hidden>ダウンロード</a>
+      <button class="x" data-modal-close type="button" aria-label="閉じる">×</button></span></div>
+    <div class="mbody" id="mv-body"><p class="muted pad">読み込み中…</p></div>`, true);
+  const body = $("#mv-body");
+  try {
+    let blob = d.source === "upload" ? await loadUpload(S.store, d.file) : await fetchRepoFile(d.gh.repo, d.gh.path, S.settings.githubToken);
+    blob = new Blob([blob], { type: mimeOf(name, d.file?.type) });
+    if ($("#modal").hidden) return;
+    modalUrl = URL.createObjectURL(blob);
+    for (const id of ["mv-tab", "mv-dl"]) { const a = $("#" + id); a.href = modalUrl; a.hidden = false; }
+    const kind = fileKind(name, blob.type);
+    if (kind === "pdf") body.innerHTML = `<iframe class="pdf" src="${modalUrl}" title="${esc(d.title)}"></iframe>`;
+    else if (kind === "image") body.innerHTML = `<div class="pad center"><img src="${modalUrl}" alt="${esc(d.title)}"></div>`;
+    else if (kind === "docx") body.innerHTML = `<article class="md doc pad">${await docxToHtml(await blob.arrayBuffer())}</article>`;
+    else if (kind === "text") body.innerHTML = `<article class="md doc pad">${await renderMarkdown(await blob.text())}</article>`;
+    else body.innerHTML = `<div class="pad"><p>${kind === "slides" ? "PowerPointはブラウザで直接表示できません。" : "この形式はプレビューできません。"}「ダウンロード」から開いてください。</p>${kind === "slides" ? `<p class="hint">PowerPointの「エクスポート → PDF」で作ったPDFも一緒に登録しておくと、Nexora上で閲覧できます。</p>` : ""}</div>`;
+    $("#mv-tab").hidden = kind === "other" || kind === "slides";
+  } catch (e) {
+    body.innerHTML = `<p class="err pad">${esc(e.message)}</p>`;
+  }
+}
+
+document.addEventListener("click", (ev) => {
+  if (ev.target.id === "modal" || ev.target.closest("[data-modal-close]")) { closeModal(); return; }
+  if (ev.target.id === "df-list") loadRepoList();
+});
+document.addEventListener("change", (ev) => { if (ev.target.name === "df-src") syncSrcBoxes(); });
+document.addEventListener("submit", (ev) => { if (ev.target.id === "doc-form") { ev.preventDefault(); ev.stopImmediatePropagation(); saveDocForm(); } }, true);
+
+/* ================= view: help ================= */
+function viewHelp() {
+  return `<div class="head"><div><h1>使い方</h1><div class="purpose">Nexoraは「その日、研究のどこを、どうやって、なぜ進めたか」を残すための研究ログです。</div></div></div>
+  <section class="panel help">
+    <h2>保管場所の役割分担</h2>
+    <pre class="diagram">【GitHub】tattuun/Nexora ……… Nexoraアプリ本体
+【GitHub】研究コードのリポジトリ … 例：tattuun/check-swing（コードと変更履歴）
+【Firebase】Firestore ………… 日々の記録・研究の流れ・アップロードした資料</pre>
+    <p>コードの「何を変えたか」はGitHubが正確に覚えます。人が書くのは「なぜそうしたか」だけ、という分担です。</p>
+  </section>
+  <section class="panel help">
+    <h2>普段の1日の流れ</h2>
+    <ol class="steps">
+      <li><b>研究する</b>：VS Codeでコードを直して、動かして、結果を見ます。</li>
+      <li><b>キリのいいところでGitHubに送る</b>：VS Codeの「ソース管理」で、変更内容をひとこと書いて「コミット」、続けて「変更の同期」。1日に何回やっても構いません。</li>
+      <li><b>Nexoraで記録を書く</b>：カテゴリで「＋ 追加」。前回の「次にやること」が上に出ます。「この日のコミット」にチェックを付け、「なぜそうしたか」を書いて保存（Ctrl+Enterでも保存）。疲れた日は「ひとことで」だけでもOK。</li>
+      <li><b>振り返る</b>：記録のコミットのリンクから、その日どの行をどう変えたかをGitHubで見られます。週末は「週次まとめ」でゼミ報告の下書きを作れます。</li>
+    </ol>
+  </section>
+  <section class="panel help">
+    <h2>画面の説明</h2>
+    <dl class="kvh">
+      <dt>ホーム</dt><dd>研究テーマの一覧（目的＝簡略版）、近い期限、最近の記録。左上の「Nexora」でいつでも戻れます。</dd>
+      <dt>カテゴリ</dt><dd>研究テーマごとの日々の記録。検索欄で作業・理由・コード・コミットを横断検索できます。</dd>
+      <dt>成果物</dt><dd>カテゴリ画面の上部。発表スライド・予稿・ポスターなどを登録し、「閲覧」でNexora内で読めます。</dd>
+      <dt>詳細</dt><dd>目的・最終期限・GitHubリポジトリ・ロードマップ（マイルストーン）・研究の流れ（詳しい版）・関連資料。</dd>
+      <dt>週次まとめ</dt><dd>1週間分の記録からゼミ報告の下書きを作成。「依頼文をコピー」してclaude.aiに貼れば、APIキーなしで使えます。</dd>
+      <dt>設定・バックアップ</dt><dd>GitHubトークン・APIキー（端末ごとに保存）、Markdown／JSONでの書き出しと復元。</dd>
+    </dl>
+  </section>
+  <section class="panel help">
+    <h2>研究の流れ・資料・成果物</h2>
+    <ul>
+      <li><b>研究の流れ</b>：詳細の中。「Word・Markdownから取り込む」で、Wordのロードマップを見出し・表・チェックボックスつきの文章に変換して保存できます。取り込んだ後もここで編集できます。</li>
+      <li><b>資料・成果物の置き場所</b>は3通り。
+        <ul>
+          <li><b>GitHubのファイル</b>（おすすめ）：研究リポジトリの <code>docs/</code> などにPDFやWordを入れてコミット＆同期 →「ファイル一覧を読み込む」で選ぶ。閲覧もGitHubへのジャンプもできます。</li>
+          <li><b>Nexoraにアップロード</b>：15MBまで。Gitに入れたくない資料向け。</li>
+          <li><b>リンクだけ</b>：Google Driveや学会ページなど。</li>
+        </ul></li>
+      <li>閲覧できるのはPDF・Word（.docx）・画像・Markdown。PowerPointはPDFに書き出したものも登録しておくと便利です。</li>
+    </ul>
+  </section>
+  <section class="panel help">
+    <h2>コミットのコツ</h2>
+    <ul>
+      <li>「うまく動いた」「ここで一区切り」と思ったらこまめに。コミットした時点の状態だけが履歴に残ります。</li>
+      <li>メッセージは「何を変えたか」を短く。例：<code>閾値を0.6→0.5に変更</code>、<code>右打者に対応</code>。理由はNexoraに書きます。</li>
+      <li>重み（.pt .engine .onnx）・動画・出力CSVは <code>.gitignore</code> で除外済み。これらはGitHubにバックアップされないので、大事な重みは別の場所にもコピーを。</li>
+    </ul>
+  </section>
+  <section class="panel help">
+    <h2>困ったとき</h2>
+    <dl class="kvh">
+      <dt>変更が反映されない</dt><dd>Ctrl+Shift+R で再読み込み（スマホはタブを開き直す）。</dd>
+      <dt>コミットが出ない</dt><dd>VS Codeで「同期」まで済んでいるか、詳細にリポジトリを登録したか、この端末の設定にトークンを入れたかを確認。表示されるのは既定ブランチ（main）のコミットです。</dd>
+      <dt>「トークンが無効」</dt><dd>有効期限切れ。GitHubで作り直して「設定・バックアップ」に入れ直します（Contents: Read-only、対象リポジトリを選択）。新しい研究リポジトリを作った時も、トークンの対象に追加が必要です。</dd>
+      <dt>赤い帯が出た</dt><dd>Firestoreに拒否されています。ルールが公開済みか、UIDが一致しているかを確認。</dd>
+      <dt>バックアップ</dt><dd>月に1回「JSONで全データ書き出し」を。添付・資料も含めて復元できます。</dd>
+    </dl>
+  </section>`;
+}
 
 /* ================= boot ================= */
 (async () => {
@@ -707,7 +1042,12 @@ document.addEventListener("keydown", (ev) => {
     }
     S.user = user;
     if (!user) { S.cats = []; S.logs = []; S.summaries = []; return renderLogin(); }
-    const onErr = (e) => { console.error(e); toast(e?.code === "permission-denied" ? "読み込みが拒否されました。firestore.rules を確認してください" : "同期が切れました。再読み込みしてください"); };
+    S.syncError = "";
+    const onErr = (e) => {
+      console.error(e);
+      S.syncError = e?.code === "permission-denied" ? DENIED_MSG : `データとの同期が切れました（${e?.code || "不明なエラー"}）。ページを再読み込みしてください。`;
+      render();
+    };
     const sub = (c, setter) => S.unsub.push(S.store.subscribe(c, (docs) => {
       setter(docs);
       render();
@@ -715,6 +1055,7 @@ document.addEventListener("keydown", (ev) => {
     sub("categories", (d) => (S.cats = d));
     sub("logs", (d) => (S.logs = d));
     sub("summaries", (d) => (S.summaries = d));
+    sub("docs", (d) => (S.docs = d));
     render();
   });
 })();

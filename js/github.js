@@ -46,3 +46,26 @@ export async function commitsOn(repo, dateStr, token) {
 export async function commitInfo(repo, sha, token) {
   return toCommit(repo, await gh(`/repos/${repo}/commits/${sha}`, token));
 }
+
+/* ---------- リポジトリ内のファイル（資料・成果物用） ---------- */
+const encPath = (p) => String(p).split("/").map(encodeURIComponent).join("/");
+export const githubFileUrl = (repo, path) => `https://github.com/${repo}/blob/HEAD/${encPath(path)}`;
+
+const DOC_EXT = /\.(pdf|docx|pptx|md|markdown|txt|png|jpe?g|gif|webp|svg)$/i;
+export async function listRepoFiles(repo, token) {
+  const r = await gh(`/repos/${repo}/git/trees/HEAD?recursive=1`, token);
+  return (r.tree || []).filter((t) => t.type === "blob" && DOC_EXT.test(t.path)).map((t) => ({ path: t.path, size: t.size || 0 }));
+}
+
+export async function fetchRepoFile(repo, path, token) {
+  const headers = { Accept: "application/vnd.github.raw+json", "X-GitHub-Api-Version": "2022-11-28" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let res;
+  try { res = await fetch(`${API}/repos/${repo}/contents/${encPath(path)}`, { headers }); }
+  catch { throw new Error("GitHubに接続できません。通信状況を確認してください"); }
+  if (res.ok) return res.blob();
+  if (res.status === 404) throw new Error("GitHub上にファイルが見つかりません。名前を変えたり消したりしていないか確認してください");
+  if (res.status === 401) throw new Error("GitHubトークンが無効です。設定で入れ直してください");
+  if (res.status === 403) throw new Error("GitHubの利用回数の上限か、ファイルが大きすぎます。「GitHubで開く」から見てください");
+  throw new Error(`GitHubエラー（${res.status}）`);
+}
