@@ -52,6 +52,7 @@ const S = {
   unsub: [],
   syncError: "",
   flowEdit: false, flowOverride: null,
+  openLogs: new Set(),      // 詳細を開いている記録
 };
 
 /* ================= storage helpers ================= */
@@ -186,7 +187,7 @@ function viewCat() {
   ${viewOutputs(c)}
   ${S.showDetail ? viewDetail(c) : ""}
   ${S.editing ? viewEditor(c) : ""}
-  <div class="tools"><input type="search" id="q" placeholder="このカテゴリの記録を検索（作業・理由・コード・コミット）" value="${esc(S.q)}" aria-label="検索"><span class="lbl">${logs.length}件</span></div>
+  <div class="tools"><input type="search" id="q" placeholder="このカテゴリの記録を検索（作業・理由・コード・コミット）" value="${esc(S.q)}" aria-label="検索"><span class="lbl">${logs.length}件</span>${logs.length && !S.q ? `<button class="btn sm" id="tg-all" type="button">${logs.every((l) => S.openLogs.has(l.id)) ? "すべて閉じる" : "すべて開く"}</button>` : ""}</div>
   ${logs.length ? `<ol class="tl">${logs.map((l) => viewLog(l, c)).join("")}</ol>` : `<div class="empty">${S.q ? "一致する記録はありません。" : "まだ記録がありません。「＋ 追加」から今日の作業を残しましょう。"}</div>`}`;
 }
 
@@ -275,8 +276,12 @@ function viewLog(l, c) {
   const links = (l.links || []).filter(Boolean);
   const commits = l.commits || [];
   const att = l.attach || [];
+  const open = !!S.q || S.openLogs.has(l.id);
+  const meta = [commits.length ? `コミット ${commits.length}` : "", att.length ? `添付 ${att.length}` : "", l.code ? "コード" : ""].filter(Boolean);
+  const head = `<button class="sum" data-log-toggle="${esc(l.id)}" aria-expanded="${open}" type="button"><span class="caret" aria-hidden="true">${open ? "▾" : "▸"}</span><h3>${esc(l.title || "（無題）")}</h3>${part ? `<span class="chip">${esc(part.title)}</span>` : ""}${!open && meta.length ? `<span class="meta">${meta.join("・")}</span>` : ""}</button>`;
+  if (!open) return `<li class="entry"><div class="date"><b>${esc(m)}/${esc(d)}</b><span>${esc(y)} (${wd})</span></div><article class="card closed">${head}</article></li>`;
   return `<li class="entry"><div class="date"><b>${esc(m)}/${esc(d)}</b><span>${esc(y)} (${wd})</span></div>
-  <article class="card"><div class="top"><h3>${esc(l.title)}</h3>${part ? `<span class="chip">${esc(part.title)}</span>` : ""}</div>
+  <article class="card">${head}
   <dl class="sec">${l.work ? `<dt>作業内容</dt><dd>${esc(l.work)}</dd>` : ""}${l.reason ? `<dt>理由・意図</dt><dd class="why">${esc(l.reason)}</dd>` : ""}${l.result ? `<dt>結果・次</dt><dd>${esc(l.result)}</dd>` : ""}${commits.length ? `<dt>コミット</dt><dd class="ck">${commits.map((k) => `<a href="${esc(k.url)}" target="_blank" rel="noopener" title="${esc(k.message)}"><code>${esc(k.repo.split("/")[1])}@${esc(k.sha.slice(0, 7))}</code>${esc(k.message)}</a>`).join("")}</dd>` : ""}${links.length ? `<dt>リンク</dt><dd class="links">${links.map((u) => (/^https?:\/\//.test(u) ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>` : esc(u))).join("<br>")}</dd>` : ""}</dl>
   ${att.length ? `<div class="thumbs">${att.map((a) => `<button type="button" data-open-att="${esc(a.id)}" title="${esc(a.name)}">${a.thumb ? `<img src="${a.thumb}" alt="${esc(a.name)}">` : `<span class="file">${esc(a.name)}</span>`}</button>`).join("")}</div>` : ""}
   ${l.code ? `<div class="codebox"><div class="bar"><span>${esc(l.lang || "code")}</span><button class="btn sm" data-copy="${esc(l.id)}" type="button">コピー</button></div><pre><code>${esc(l.code)}</code></pre></div>` : ""}
@@ -515,6 +520,8 @@ document.addEventListener("click", async (ev) => {
   if (t.id === "tg-detail") { S.showDetail = !S.showDetail; render(); return; }
   if (t.id === "new-log") { openEditor("new"); $("#e-title")?.focus(); return; }
   if (t.id === "e-cancel") { S.editing = null; S.draft = null; render(); return; }
+  if (t.dataset.logToggle) { const id = t.dataset.logToggle; S.openLogs.has(id) ? S.openLogs.delete(id) : S.openLogs.add(id); render(); return; }
+  if (t.id === "tg-all") { const ls = logsOf(S.sel); const all = ls.every((l) => S.openLogs.has(l.id)); ls.forEach((l) => (all ? S.openLogs.delete(l.id) : S.openLogs.add(l.id))); render(); return; }
   if (t.dataset.edit) { openEditor(t.dataset.edit); $("#editor")?.scrollIntoView({ block: "start" }); return; }
   if (t.dataset.openAtt) { openAttachment(t.dataset.openAtt); return; }
   if (t.dataset.attDel) {
@@ -686,6 +693,7 @@ document.addEventListener("submit", (ev) => {
     };
     if (JSON.stringify(body).length > 900_000) return toast("1件の記録が大きすぎます。コード断片を短くしてください");
     S.editing = null; S.draft = null;
+    S.openLogs.add(id);
     put("logs", id, body);
     toast("記録しました");
     render();
