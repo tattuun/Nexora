@@ -124,3 +124,96 @@ export async function loadUpload(store, meta) {
 export async function removeUpload(store, meta) {
   for (let i = 0; i < (meta?.chunks || 0); i++) await store.remove("blobs", `${meta.id}_${i}`);
 }
+
+/* ---------- PDF（スマホ向け：PDF.js で全ページを描画） ---------- */
+// iPhone の Safari は埋め込みPDFの1ページ目しか表示しないため、スマホでは PDF.js を使う
+const PDFJS = VENDOR + "pdfjs-5.4.394/";
+// 埋め込まれていない日本語フォント等が必要なPDFのときだけ、CDNから補助データを取りに行く
+const PDFJS_CDN = "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.4.394/";
+let pdfjsP = null;
+function pdfjs() {
+  return (pdfjsP ??= import(PDFJS + "pdf.min.mjs").then((m) => {
+    m.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.mjs";
+    return m;
+  }).catch((e) => { pdfjsP = null; throw e; }));
+}
+
+export const isMobile = () =>
+  /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1) ||
+  matchMedia("(pointer: coarse)").matches;
+
+// container に全ページを並べる。見えているページだけ描画し、遠いページは解放してメモリを抑える
+export async function renderPdf(container, buf) {
+  const lib = await pdfjs();
+  const doc = await lib.getDocument({
+    data: new Uint8Array(buf),
+    cMapUrl: PDFJS_CDN + "cmaps/", cMapPacked: true,
+    standardFontDataUrl: PDFJS_CDN + "standard_fonts/",
+    isEvalSupported: false,
+  }).promise;
+  const pages = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const p = await doc.getPage(i);
+    const vp = p.getViewport({ scale: 1 });
+    pages.push({ p, w: vp.width, h: vp.height });
+  }
+  let zoom = 1;
+  container.innerHTML = "";
+  container.classList.add("pdfjs");
+  const wraps = pages.map((pg, i) => {
+    const el = document.createElement("div");
+    el.className = "pdfpage";
+    el.dataset.i = i;
+    el.style.aspectRatio = `${pg.w} / ${pg.h}`;
+    container.appendChild(el);
+    return el;
+  });
+  const layout = () => wraps.forEach((el) => (el.style.width = `calc(${zoom * 100}% - 20px)`));
+  layout();
+
+  const tasks = new Map();
+  async function draw(i) {
+    const el = wraps[i];
+    if (el.dataset.drawn === String(zoom) || tasks.has(i)) return;
+    const pg = pages[i];
+    const cssW = el.clientWidth || container.clientWidth;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // iPhone のキャンバス上限（約1600万画素）を超えないように抑える
+    const scale = Math.min((cssW * dpr) / pg.w, Math.sqrt(12e6 / (pg.w * pg.h)));
+    const vp = pg.p.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(vp.width);
+    canvas.height = Math.floor(vp.height);
+    const task = pg.p.render({ canvas, canvasContext: canvas.getContext("2d"), viewport: vp });
+    tasks.set(i, task);
+    try {
+      await task.promise;
+      el.replaceChildren(canvas);
+      el.dataset.drawn = String(zoom);
+    } catch { /* キャンセル */ } finally { tasks.delete(i); }
+  }
+  function release(i) {
+    tasks.get(i)?.cancel();
+    const c = wraps[i].querySelector("canvas");
+    if (c) { c.width = 0; c.height = 0; wraps[i].replaceChildren(); }
+    delete wraps[i].dataset.drawn;
+  }
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const i = +e.target.dataset.i;
+      e.isIntersecting ? draw(i) : release(i);
+    }
+  }, { root: container.closest(".mbody") || null, rootMargin: "1200px 0px" });
+  wraps.forEach((el) => io.observe(el));
+
+  return {
+    pages: doc.numPages,
+    setZoom(z) {
+      zoom = z;
+      layout();
+      wraps.forEach((el, i) => { if (el.dataset.drawn) { delete el.dataset.drawn; draw(i); } });
+    },
+    destroy() { io.disconnect(); tasks.forEach((t) => t.cancel()); doc.destroy(); },
+  };
+}

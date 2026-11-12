@@ -64,7 +64,9 @@ export async function fetchRepoFile(repo, path, token) {
   try { res = await fetch(`${API}/repos/${repo}/contents/${encPath(path)}`, { headers }); }
   catch { throw new Error("GitHubに接続できません。通信状況を確認してください"); }
   if (res.ok) return res.blob();
-  if (res.status === 404) throw new Error("GitHub上にファイルが見つかりません。名前を変えたり消したりしていないか確認してください");
+  if (res.status === 404) throw new Error(token
+    ? "GitHub上にファイルが見つかりません。名前を変えたり消したりしていないか確認してください"
+    : "この端末にGitHubトークンが入っていません。非公開リポジトリの資料を見るには、この端末の「設定・バックアップ」でトークンを入れてください");
   if (res.status === 401) throw new Error("GitHubトークンが無効です。設定で入れ直してください");
   if (res.status === 403) throw new Error("GitHubの利用回数の上限か、ファイルが大きすぎます。「GitHubで開く」から見てください");
   throw new Error(`GitHubエラー（${res.status}）`);

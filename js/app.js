@@ -1,7 +1,7 @@
 import { createStore, isDemo } from "./store.js";
 import { ALLOWED_EMAIL } from "./config.js";
 import { parseRepo, parseCommitUrl, commitsOn, commitInfo, githubFileUrl, listRepoFiles, fetchRepoFile } from "./github.js";
-import { renderMarkdown, cachedMarkdown, docxToHtml, docxToMarkdown, fileKind, mimeOf, saveUpload, loadUpload, removeUpload } from "./docs.js";
+import { renderMarkdown, cachedMarkdown, docxToHtml, docxToMarkdown, fileKind, mimeOf, saveUpload, loadUpload, removeUpload, isMobile, renderPdf } from "./docs.js";
 import { DEFAULT_MODEL, weekRange, shiftDate, buildPrompt, callClaude, ymd } from "./summary.js";
 
 /* ================= util ================= */
@@ -827,6 +827,7 @@ async function importFlow(file) {
 
 /* ---------- モーダル（資料の登録・閲覧） ---------- */
 let modalUrl = null;
+let pdfView = null;
 function showModal(html, wide) {
   const m = $("#modal");
   $("#modal-box").className = "modal-box" + (wide ? " wide" : "");
@@ -839,6 +840,7 @@ function closeModal() {
   $("#modal").hidden = true;
   $("#modal-box").innerHTML = "";
   document.body.style.overflow = "";
+  if (pdfView) { pdfView.destroy(); pdfView = null; }
   if (modalUrl) { URL.revokeObjectURL(modalUrl); modalUrl = null; }
 }
 
@@ -947,7 +949,8 @@ async function openViewer(d) {
       ${d.url ? `<a class="btn sm" href="${esc(d.url)}" target="_blank" rel="noopener">リンク</a>` : ""}
       <a class="btn sm" id="mv-tab" target="_blank" rel="noopener" hidden>新しいタブで開く</a>
       <a class="btn sm" id="mv-dl" download="${esc(name)}" hidden>ダウンロード</a>
-      <button class="x" data-modal-close type="button" aria-label="閉じる">×</button></span></div>
+      <button class="x" data-modal-close type="button" aria-label="閉じる">×</button></span>
+      <div class="pdfzoom" id="mv-zoom" hidden></div></div>
     <div class="mbody" id="mv-body"><p class="muted pad">読み込み中…</p></div>`, true);
   const body = $("#mv-body");
   try {
@@ -957,20 +960,34 @@ async function openViewer(d) {
     modalUrl = URL.createObjectURL(blob);
     for (const id of ["mv-tab", "mv-dl"]) { const a = $("#" + id); a.href = modalUrl; a.hidden = false; }
     const kind = fileKind(name, blob.type);
-    if (kind === "pdf") body.innerHTML = `<iframe class="pdf" src="${modalUrl}" title="${esc(d.title)}"></iframe>`;
+    if (kind === "pdf" && isMobile()) {
+      body.innerHTML = `<p class="muted pad">PDFを表示しています…</p>`;
+      const v = await renderPdf(body, await blob.arrayBuffer());
+      if ($("#modal").hidden) { v.destroy(); return; }
+      pdfView = v;
+      $("#mv-zoom").innerHTML = `<span class="muted">${v.pages}ページ</span>${[1, 1.5, 2].map((z) => `<button class="btn sm" data-pdf-zoom="${z}" aria-pressed="${z === 1}" type="button">${z === 1 ? "幅に合わせる" : `${z * 100}%`}</button>`).join("")}`;
+      $("#mv-zoom").hidden = false;
+    } else if (kind === "pdf") body.innerHTML = `<iframe class="pdf" src="${modalUrl}" title="${esc(d.title)}"></iframe>`;
     else if (kind === "image") body.innerHTML = `<div class="pad center"><img src="${modalUrl}" alt="${esc(d.title)}"></div>`;
     else if (kind === "docx") body.innerHTML = `<article class="md doc pad">${await docxToHtml(await blob.arrayBuffer())}</article>`;
     else if (kind === "text") body.innerHTML = `<article class="md doc pad">${await renderMarkdown(await blob.text())}</article>`;
     else body.innerHTML = `<div class="pad"><p>${kind === "slides" ? "PowerPointはブラウザで直接表示できません。" : "この形式はプレビューできません。"}「ダウンロード」から開いてください。</p>${kind === "slides" ? `<p class="hint">PowerPointの「エクスポート → PDF」で作ったPDFも一緒に登録しておくと、Nexora上で閲覧できます。</p>` : ""}</div>`;
     $("#mv-tab").hidden = kind === "other" || kind === "slides";
   } catch (e) {
-    body.innerHTML = `<p class="err pad">${esc(e.message)}</p>`;
+    console.error(e);
+    const msg = e?.name === "InvalidPDFException" ? "PDFとして読み込めませんでした。ファイルが壊れていないか確認してください" : e.message || "表示できませんでした";
+    body.innerHTML = `<div class="pad"><p class="err">${esc(msg)}</p><p class="hint">表示できない場合は「ダウンロード」や「GitHubで開く」からも確認できます。</p></div>`;
   }
 }
 
 document.addEventListener("click", (ev) => {
   if (ev.target.id === "modal" || ev.target.closest("[data-modal-close]")) { closeModal(); return; }
   if (ev.target.id === "df-list") loadRepoList();
+  const zb = ev.target.closest("[data-pdf-zoom]");
+  if (zb && pdfView) {
+    pdfView.setZoom(+zb.dataset.pdfZoom);
+    document.querySelectorAll("[data-pdf-zoom]").forEach((b) => b.setAttribute("aria-pressed", String(b === zb)));
+  }
 });
 document.addEventListener("change", (ev) => { if (ev.target.name === "df-src") syncSrcBoxes(); });
 document.addEventListener("submit", (ev) => { if (ev.target.id === "doc-form") { ev.preventDefault(); ev.stopImmediatePropagation(); saveDocForm(); } }, true);
@@ -1016,6 +1033,7 @@ function viewHelp() {
           <li><b>リンクだけ</b>：Google Driveや学会ページなど。</li>
         </ul></li>
       <li>閲覧できるのはPDF・Word（.docx）・画像・Markdown。PowerPointはPDFに書き出したものも登録しておくと便利です。</li>
+      <li><b>スマホで閲覧</b>：PDFは全ページを縦に並べて表示し、「150%」「200%」で拡大できます。GitHubに置いた資料をスマホで見るには、スマホの「設定・バックアップ」にもGitHubトークンが必要です（Nexoraに直接アップロードした資料はトークン不要）。</li>
     </ul>
   </section>
   <section class="panel help">
